@@ -2,7 +2,15 @@
 API principale pour le Système de Filtrage Automatique des Candidats.
 Ce fichier initialise l'application FastAPI et enregistre tous les routeurs (Jobs, CVs, Screening, Chatbot).
 """
+import os
 from fastapi import FastAPI
+from dotenv import load_dotenv
+
+# Charger les variables d'environnement depuis le fichier .env (avec override pour refléter les changements)
+base_dir = os.path.dirname(os.path.abspath(__file__))
+env_path = os.path.join(base_dir, "..", ".env")
+load_dotenv(dotenv_path=env_path, override=True)
+print(f"--- SERVER STARTUP --- MODE: {os.getenv('LLM_MODE')} | MODEL: {os.getenv('LLM_MODEL')}")
 from app.routes.jobs import router as jobs_router
 from app.routes.cvs import router as cvs_router
 from app.routes.screening import router as screening_router

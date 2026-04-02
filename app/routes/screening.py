@@ -7,18 +7,18 @@ from app.models.schemas import JobRequirement, CandidateCV, ScreeningResult
 from app.services.scoring import calculate_screening_score
 from app.database import mock_jobs, mock_candidates, mock_screening_results
 
+
 router = APIRouter()
 
 def save_screening_result(result: ScreeningResult):
     """
     Sauvegarde ou met à jour un résultat de screening dans la base simulée.
     """
-    # Supprimer l'ancien résultat s'il existe pour ce couple Job/Candidat
-    global mock_screening_results
-    mock_screening_results = [
-        s for s in mock_screening_results 
-        if not (s.job_id == result.job_id and s.candidate_id == result.candidate_id)
-    ]
+    # On vide et on remplit la liste importée pour garder la référence globale
+    for i, s in enumerate(mock_screening_results):
+        if s.job_id == result.job_id and s.candidate_id == result.candidate_id:
+            mock_screening_results.pop(i)
+            break
     mock_screening_results.append(result)
 
 @router.post("/test")

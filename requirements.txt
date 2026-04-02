@@ -3,4 +3,4 @@ uvicorn
 pydantic
 email-validator
 python-multipart
-pymupdf
+pymupdf

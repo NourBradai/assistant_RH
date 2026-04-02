@@ -68,14 +68,74 @@ class ScreeningResult(BaseModel):
     status: str  # 'shortlisted' ou 'rejected'
 
 
+from typing import List, Optional
+from pydantic import BaseModel, Field
+
+
+class ChatQuestion(BaseModel):
+    """
+    Représente une question du chatbot, déjà prête à être posée au candidat.
+    """
+    question_id: str
+    question_type: str
+    question_text: str
+    objective: str
+    expected_signals: List[str] = Field(default_factory=list)
+    weight: float = 1.0
+    priority: str = "medium"
+
+
+class QuestionAnalysis(BaseModel):
+    """
+    Représente l'analyse d'une réponse du candidat.
+    Tous les scores sont sur 100.
+    """
+    relevance_score: float = 0.0
+    evidence_score: float = 0.0
+    clarity_score: float = 0.0
+    stance_score: float = 0.0
+    final_answer_score: float = 0.0
+    justification: str = ""
+
+
+class ChatTurn(BaseModel):
+    """
+    Représente un tour de conversation :
+    une question + une réponse + l'analyse de cette réponse.
+    """
+    question: ChatQuestion
+    answer_text: Optional[str] = None
+    analysis: Optional[QuestionAnalysis] = None
+
+
 class ChatbotSession(BaseModel):
     """
-    Gère l'état d'un entretien interactif via chatbot.
+    Représente toute la session chatbot pour un candidat donné.
     """
-    candidate_id: str
+    session_id: str
     job_id: str
-    questions: List[str] = []
-    answers: List[str] = []
-    chatbot_score: float = 0
-    final_score: float = 0
+    candidate_id: str
+    initial_score: float = 0.0
+    questions: List[ChatQuestion] = Field(default_factory=list)
+    turns: List[ChatTurn] = Field(default_factory=list)
+    current_index: int = 0
+    chatbot_score: float = 0.0
+    final_score: float = 0.0
     final_decision: str = "pending"
+    status: str = "active"
+
+
+class StartChatbotRequest(BaseModel):
+    """
+    Requête pour démarrer une session chatbot.
+    """
+    job_id: str
+    candidate_id: str
+
+
+class SubmitAnswerRequest(BaseModel):
+    """
+    Requête pour soumettre une réponse à la question courante.
+    """
+    session_id: str
+    answer_text: str
