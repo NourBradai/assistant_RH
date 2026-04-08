@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Any
+from typing import Any, Optional
 
 import httpx
 
@@ -9,6 +9,8 @@ from app.models.schemas import (
     QuestionAnalysis,
     JobRequirement,
     CandidateCV,
+    ParsedJobProfile,
+    ParsedCandidateProfile
 )
 
 
@@ -39,250 +41,199 @@ def llm_is_configured() -> bool:
 
 def build_question_generation_prompt(
     question: ChatQuestion,
-    job: JobRequirement,
-    candidate: CandidateCV,
+    job: ParsedJobProfile,
+    candidate: ParsedCandidateProfile,
 ) -> str:
     """
-    Construit le prompt de génération de question.
+    Construit le prompt de génération de question (Reformulation naturelle).
     """
     return f"""
-Tu es un assistant de présélection RH.
-
-Ta tâche :
-reformuler UNE seule question de manière naturelle, professionnelle, claire et courte.
+Tu es un assistant de présélection RH expert et chaleureux.
+Ta tâche : reformuler UNE seule question de manière naturelle, professionnelle et humaine.
 
 Règles :
-- Ne mentionne pas de listes de compétences obligatoires ou d'années d'expérience de manière brute.
-- Ta question doit ressembler à une interaction humaine réelle (ex: "Compte tenu de votre parcours en..., qu'en est-il de...").
-- Ne commence pas par des introductions comme "En tant qu'assistant..." ou "Ma question est...".
+- Ne mentionne pas de listes techniques froides.
+- Utilise le contexte du CV (sections, preuves trouvées) pour personnaliser la question.
+- Ta question doit ressembler à une interaction réelle (vouvoiement).
 - Réponds UNIQUEMENT par la question.
 
-Contexte du poste :
-- Titre : {job.title}
-- Compétences obligatoires : {job.required_skills}
-- Compétences souhaitées : {job.preferred_skills}
-- Diplôme minimum : {job.minimum_degree}
-- Expérience minimum : {job.minimum_experience_years}
-- Langues requises : {job.required_languages}
-- Localisation : {job.location}
-- Type d'emploi : {job.employment_type}
+Contexte du poste : {job.title}
+Exigence visée : {question.objective}
 
-Contexte du candidat :
-- Nom : {candidate.name}
-- Compétences détectées : {candidate.skills}
-- Diplôme détecté : {candidate.degree}
-- Expérience détectée : {candidate.experience_years}
-- Langues détectées : {candidate.languages}
+Question interne de base : {question.question_text}
 
-Question interne actuelle :
-- Type : {question.question_type}
-- Texte de base : {question.question_text}
-- Objectif : {question.objective}
-- Signaux attendus : {question.expected_signals}
-
-Produis maintenant la meilleure reformulation possible.
+Produis maintenant la meilleure reformulation.
 """.strip()
 
 
 def build_answer_analysis_prompt(
     question: ChatQuestion,
     answer_text: str,
-    job: JobRequirement,
-    candidate: CandidateCV,
 ) -> str:
     """
     Construit le prompt d'analyse d'une réponse.
-    Le LLM doit répondre en JSON strict.
+    Force le LLM à répondre en JSON.
     """
     return f"""
-Tu es un assistant d'analyse de réponses dans un chatbot de présélection RH.
+Tu es un expert RH analysant une réponse de candidat.
+Analyse la réponse par rapport à l'exigence : {question.objective}
 
-Ta tâche :
-analyser la réponse du candidat à UNE question précise.
-
-Important :
-- Tu dois répondre uniquement en JSON valide.
-- Aucune phrase avant ou après le JSON.
-- Tous les scores doivent être entre 0 et 100.
-- Tu dois être strict, cohérent et factuel.
-- Si la réponse est vague, note-la faiblement.
-- Si la réponse contient des preuves concrètes, valorise-la.
-- Évalue la réponse selon 4 dimensions :
-  1. relevance_score
-  2. evidence_score
-  3. clarity_score
-  4. stance_score
-
-Définitions :
-- relevance_score : la réponse traite-t-elle vraiment le sujet de la question ?
-- evidence_score : y a-t-il une preuve concrète (projet, stage, mission, exemple réel, contexte technique) ?
-- clarity_score : la réponse est-elle claire, précise, exploitable ?
-- stance_score : la réponse est-elle affirmative, négative, partielle ou hésitante ?
-
-Calcule aussi :
-- final_answer_score selon cette formule :
-  0.35 * relevance_score
-  + 0.30 * evidence_score
-  + 0.20 * clarity_score
-  + 0.15 * stance_score
-
-Ajoute aussi :
-- justification : une phrase courte expliquant le score
-
-Contexte du poste :
-- Titre : {job.title}
-- Compétences obligatoires : {job.required_skills}
-- Expérience minimum : {job.minimum_experience_years}
-- Diplôme minimum : {job.minimum_degree}
-- Langues requises : {job.required_languages}
-
-Contexte du candidat :
-- Nom : {candidate.name}
-- Compétences détectées : {candidate.skills}
-- Diplôme détecté : {candidate.degree}
-- Expérience détectée : {candidate.experience_years}
-- Langues détectées : {candidate.languages}
-
-Question :
-- Type : {question.question_type}
-- Texte : {question.question_text}
-- Objectif : {question.objective}
-- Signaux attendus : {question.expected_signals}
-
-Réponse du candidat :
-{answer_text}
-
-Réponds exactement sous cette forme JSON :
+JSON STRICT UNIQUEMENT :
 {{
-  "relevance_score": 0,
-  "evidence_score": 0,
-  "clarity_score": 0,
-  "stance_score": 0,
-  "final_answer_score": 0,
-  "justification": ""
+  "relevance_score": 0-100,
+  "evidence_score": 0-100,
+  "clarity_score": 0-100,
+  "stance_score": 0-100,
+  "final_answer_score": 0-100,
+  "updated_requirement_confidence": 0-100,  # Confiance finale dans la maîtrise de l'exigence
+  "justification": "..."
 }}
+
+Réponse à analyser :
+{answer_text}
 """.strip()
 
 
 def call_openai_compatible_api(prompt: str) -> str:
     """
-    Appelle une API compatible OpenAI Chat Completions.
-    Retourne le texte brut du message généré.
+    Appelle une API compatible OpenAI.
     """
     settings = get_llm_settings()
-
-    headers = {
-        "Authorization": f"Bearer {settings['api_key']}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://github.com/NourBradai/assistant_RH", # Optionnel pour OpenRouter
-        "X-Title": "Assistant RH Candidate Filtering",              # Optionnel pour OpenRouter
-    }
-
+    headers = {"Authorization": f"Bearer {settings['api_key']}", "Content-Type": "application/json"}
+    
     messages = [
-        {
-            "role": "system",
-            "content": (
-                "Tu es un recruteur expert et chaleureux. Ton rôle est de mener un court entretien de présélection. "
-                "Tu t'adresses DIRECTEMENT au candidat (vouvoiement 'vous'). "
-                "Tes questions doivent être courtes, percutantes et sonner comme une vraie conversation humaine. "
-                "Ne fais pas de listes techniques froides, intègre les éléments naturellement."
-            )
-        },
-        {
-            "role": "user",
-            "content": prompt
-        }
+        {"role": "system", "content": "Tu es un recruteur expert. Tu réponds de manière concise et directe."},
+        {"role": "user", "content": prompt}
     ]
 
-    payload: dict[str, Any] = {
-        "model": settings["model"],
-        "messages": messages,
-        "temperature": 0.7, # Légèrement plus élevé pour plus de naturel
-    }
+    payload = {"model": settings["model"], "messages": messages, "temperature": 0.3}
 
     with httpx.Client(timeout=60.0) as client:
         response = client.post(settings["api_url"], headers=headers, json=payload)
         response.raise_for_status()
-        data = response.json()
-        return data["choices"][0]["message"]["content"].strip()
+        return response.json()["choices"][0]["message"]["content"].strip()
 
 
-def fallback_generate_question(question: ChatQuestion) -> str:
+def extract_job_requirements_with_llm(raw_text: str) -> dict:
     """
-    Fallback local si aucun LLM n'est disponible.
+    Extrait les exigences structurées d'une offre d'emploi.
     """
-    return question.question_text
+    prompt = f"""
+Analyse cette offre d'emploi et extrais TOUTES les exigences en JSON.
+
+Structure souhaitée :
+{{
+  "job_title": "...",
+  "requirements": [
+    {{
+      "type": "skill|experience|degree|language|seniority|constraint",
+      "label": "Nom de l'exigence",
+      "importance": "low|medium|high|critical",
+      "required_level": "...",
+      "description": "...",
+      "category": "..."
+    }}
+  ]
+}}
+
+OFFRE :
+{raw_text}
+""".strip()
+
+    if not llm_is_configured():
+        return {"job_title": "Poste", "requirements": []}
+
+    try:
+        raw_response = call_openai_compatible_api(prompt)
+        # Nettoyage JSON
+        clean_json = raw_response.strip()
+        if clean_json.startswith("```"):
+            clean_json = clean_json.split("\n", 1)[1].rsplit("\n", 1)[0].strip()
+            if clean_json.startswith("json"): clean_json = clean_json[4:].strip()
+        return json.loads(clean_json)
+    except Exception:
+        return {"job_title": "Error", "requirements": []}
 
 
-def normalize_text(text: str) -> str:
-    return text.strip().lower() if text else ""
 
-
-def fallback_analyze_answer(question: ChatQuestion, answer_text: str) -> QuestionAnalysis:
+def parse_analysis_json(raw_text: str) -> QuestionAnalysis:
     """
-    Analyse locale de secours, simple mais stable. 
-    Plus généreuse pour les réponses affirmatives.
+    Parse le JSON d'analyse.
     """
-    answer = normalize_text(answer_text)
-    if not answer:
-        return QuestionAnalysis(
-            relevance_score=0.0,
-            evidence_score=0.0,
-            clarity_score=0.0,
-            stance_score=0.0,
-            final_answer_score=0.0,
-            justification="Réponse vide ou absente."
-        )
+    clean_json = raw_text.strip()
+    if clean_json.startswith("```"):
+        clean_json = clean_json.split("\n", 1)[1].rsplit("\n", 1)[0].strip()
+        if clean_json.startswith("json"): clean_json = clean_json[4:].strip()
+    
+    data = json.loads(clean_json)
+    return QuestionAnalysis(
+        relevance_score=float(data.get("relevance_score", 0.0)),
+        evidence_score=float(data.get("evidence_score", 0.0)),
+        clarity_score=float(data.get("clarity_score", 0.0)),
+        stance_score=float(data.get("stance_score", 0.0)),
+        final_answer_score=float(data.get("final_answer_score", 0.0)),
+        updated_requirement_confidence=float(data.get("updated_requirement_confidence", 0.0)),
+        justification=str(data.get("justification", ""))
+    )
 
-    # 1. Analyse de la position (Stance)
-    negative_markers = ["non", "no", "never", "jamais", "pas encore"]
-    partial_markers = ["pas directement", "partiellement", "un peu", "similar", "similaire"]
-    positive_markers = ["oui", "yes", "used", "utilisé", "developed", "développé", "connais", "maîtrise", "expert"]
 
-    if any(marker in answer for marker in negative_markers):
-        stance_score = 25.0
-    elif any(marker in answer for marker in partial_markers):
-        stance_score = 65.0
-    elif any(marker in answer for marker in positive_markers):
+def generate_question_with_llm(question: ChatQuestion, job: ParsedJobProfile, candidate: ParsedCandidateProfile) -> str:
+    if not llm_is_configured(): return question.question_text
+    try:
+        prompt = build_question_generation_prompt(question, job, candidate)
+        return call_openai_compatible_api(prompt)
+    except Exception: return question.question_text
+
+
+def _local_analyze_answer(question: ChatQuestion, answer_text: str) -> QuestionAnalysis:
+    """
+    Analyse locale de secours quand le LLM n'est pas disponible.
+    Basée sur des signaux textuels simples (longueur, mots-clés positifs, preuves).
+    """
+    text = answer_text.lower().strip()
+    words = text.split()
+
+    # 1. Stance (position affirmative / négative)
+    negative_markers = ["non", "no", "never", "jamais", "pas encore", "n'ai pas"]
+    partial_markers  = ["partiellement", "un peu", "similaire", "pas directement"]
+    positive_markers = ["oui", "yes", "utilisé", "developed", "réalisé", "maîtrise", "expert", "travaillé", "projet"]
+
+    if any(m in text for m in negative_markers):
+        stance_score = 20.0
+    elif any(m in text for m in partial_markers):
+        stance_score = 55.0
+    elif any(m in text for m in positive_markers):
         stance_score = 90.0
     else:
-        stance_score = 70.0
+        stance_score = 65.0
 
-    # 2. Analyse de la pertinence (Relevance)
+    # 2. Relevance (signaux de la question)
     expected = [s.lower() for s in question.expected_signals]
-    matched_signals = sum(1 for signal in expected if signal in answer)
-    # Base plus élevée si la position est positive
-    base_relevance = 50.0 if stance_score >= 80.0 else 30.0
-    relevance_score = min(100.0, base_relevance + matched_signals * 15.0)
+    matched_signals = sum(1 for s in expected if s in text)
+    base_rel = 50.0 if stance_score >= 80 else 30.0
+    relevance_score = min(100.0, base_rel + matched_signals * 10.0)
 
-    # 3. Analyse de la preuve (Evidence)
-    evidence_markers = [
-        "project", "projet", "stage", "internship", "mission",
-        "client", "api", "backend", "developed", "développé",
-        "implemented", "réalisé", "built", "used", "utilisé",
-        "entreprise", "société", "pendant", "durant", "période"
-    ]
-    evidence_hits = sum(1 for marker in evidence_markers if marker in answer)
-    base_evidence = 40.0 if len(answer.split()) > 10 else 25.0
-    evidence_score = min(100.0, base_evidence + evidence_hits * 15.0)
+    # 3. Evidence (preuves concrètes)
+    evidence_markers = ["projet", "stage", "mission", "client", "entreprise",
+                        "api", "backend", "réalisé", "développé", "pendant", "chez"]
+    evidence_hits = sum(1 for m in evidence_markers if m in text)
+    base_ev = 40.0 if len(words) > 12 else 20.0
+    evidence_score = min(100.0, base_ev + evidence_hits * 10.0)
 
-    # 4. Analyse de la clarté (Clarity)
-    word_count = len(answer.split())
-    if word_count <= 2:
-        clarity_score = 30.0
-    elif word_count <= 7:
-        clarity_score = 60.0
-    elif word_count <= 15:
-        clarity_score = 85.0
-    else:
-        clarity_score = 95.0
+    # 4. Clarity (longueur de la réponse)
+    if len(words) <= 2:    clarity_score = 25.0
+    elif len(words) <= 7:  clarity_score = 55.0
+    elif len(words) <= 15: clarity_score = 80.0
+    else:                  clarity_score = 95.0
 
     final_answer_score = round(
-        (0.35 * relevance_score)
-        + (0.30 * evidence_score)
-        + (0.20 * clarity_score)
-        + (0.15 * stance_score),
-        2
+        0.35 * relevance_score + 0.30 * evidence_score +
+        0.20 * clarity_score   + 0.15 * stance_score, 2
+    )
+
+    # updated_requirement_confidence = confiance globale qu'on peut déduire localement
+    updated_req_confidence = round(
+        0.5 * evidence_score + 0.3 * stance_score + 0.2 * relevance_score, 2
     )
 
     return QuestionAnalysis(
@@ -291,66 +242,16 @@ def fallback_analyze_answer(question: ChatQuestion, answer_text: str) -> Questio
         clarity_score=round(clarity_score, 2),
         stance_score=round(stance_score, 2),
         final_answer_score=final_answer_score,
-        justification="Analyse locale (mock mode) avec pondération optimisée pour la pertinence et les preuves."
+        updated_requirement_confidence=updated_req_confidence,
+        justification="Analyse locale (mode mock) — basée sur mots-clés et longueur de réponse."
     )
 
 
-def parse_analysis_json(raw_text: str) -> QuestionAnalysis:
-    """
-    Transforme le JSON brut renvoyé par le LLM en objet QuestionAnalysis.
-    """
-    data = json.loads(raw_text)
-
-    return QuestionAnalysis(
-        relevance_score=float(data.get("relevance_score", 0.0)),
-        evidence_score=float(data.get("evidence_score", 0.0)),
-        clarity_score=float(data.get("clarity_score", 0.0)),
-        stance_score=float(data.get("stance_score", 0.0)),
-        final_answer_score=float(data.get("final_answer_score", 0.0)),
-        justification=str(data.get("justification", "")),
-    )
-
-
-def generate_question_with_llm(
-    question: ChatQuestion,
-    job: JobRequirement,
-    candidate: CandidateCV,
-) -> str:
-    """
-    Génère la version visible de la question.
-    Si le LLM n'est pas configuré, retourne la question locale.
-    """
+def analyze_answer_with_llm(question: ChatQuestion, answer_text: str) -> QuestionAnalysis:
     if not llm_is_configured():
-        return fallback_generate_question(question)
-
+        return _local_analyze_answer(question, answer_text)
     try:
-        prompt = build_question_generation_prompt(question, job, candidate)
-        generated_text = call_openai_compatible_api(prompt)
-
-        if not generated_text:
-            return fallback_generate_question(question)
-
-        return generated_text
-    except Exception:
-        return fallback_generate_question(question)
-
-
-def analyze_answer_with_llm(
-    question: ChatQuestion,
-    answer_text: str,
-    job: JobRequirement,
-    candidate: CandidateCV,
-) -> QuestionAnalysis:
-    """
-    Analyse une réponse avec le LLM si possible.
-    Sinon utilise une analyse locale de secours.
-    """
-    if not llm_is_configured():
-        return fallback_analyze_answer(question, answer_text)
-
-    try:
-        prompt = build_answer_analysis_prompt(question, answer_text, job, candidate)
-        raw_response = call_openai_compatible_api(prompt)
-        return parse_analysis_json(raw_response)
-    except Exception:
-        return fallback_analyze_answer(question, answer_text)
+        prompt = build_answer_analysis_prompt(question, answer_text)
+        return parse_analysis_json(call_openai_compatible_api(prompt))
+    except Exception as e:
+        return _local_analyze_answer(question, answer_text)

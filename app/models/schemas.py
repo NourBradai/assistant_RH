@@ -2,8 +2,10 @@
 Définition des schémas de données Pydantic utilisés pour la validation des requêtes et réponses API.
 Ce fichier contient les modèles pour les jobs, les CVs, les résultats de screening et les sessions chatbot.
 """
+from __future__ import annotations
 from pydantic import BaseModel, Field, EmailStr
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
+from datetime import datetime
 
 
 class JobWeights(BaseModel):
@@ -68,10 +70,6 @@ class ScreeningResult(BaseModel):
     status: str  # 'shortlisted' ou 'rejected'
 
 
-from typing import List, Optional
-from pydantic import BaseModel, Field
-
-
 class ChatQuestion(BaseModel):
     """
     Représente une question du chatbot, déjà prête à être posée au candidat.
@@ -80,6 +78,7 @@ class ChatQuestion(BaseModel):
     question_type: str
     question_text: str
     objective: str
+    target_requirement_id: Optional[str] = None  # ID de l'exigence ciblée
     expected_signals: List[str] = Field(default_factory=list)
     weight: float = 1.0
     priority: str = "medium"
@@ -95,6 +94,7 @@ class QuestionAnalysis(BaseModel):
     clarity_score: float = 0.0
     stance_score: float = 0.0
     final_answer_score: float = 0.0
+    updated_requirement_confidence: Optional[float] = None  # Nouveau score suggéré pour l'exigence cible
     justification: str = ""
 
 
@@ -116,6 +116,7 @@ class ChatbotSession(BaseModel):
     job_id: str
     candidate_id: str
     initial_score: float = 0.0
+    initial_screening: Optional[EnhancedScreeningResult] = None  # Résultats Détaillés
     questions: List[ChatQuestion] = Field(default_factory=list)
     turns: List[ChatTurn] = Field(default_factory=list)
     current_index: int = 0
@@ -139,3 +140,73 @@ class SubmitAnswerRequest(BaseModel):
     """
     session_id: str
     answer_text: str
+
+
+# --- Nouveaux modèles pour l'Approche "Requirement-Driven" ---
+
+class JobRequirementItem(BaseModel):
+    """
+    Représente une exigence atomique extraite d'une offre d'emploi.
+    """
+    requirement_id: str
+    type: str  # 'skill', 'experience', 'degree', 'language', 'seniority', 'constraint'
+    label: str  # ex: "FastAPI"
+    importance: str = "medium"  # 'low', 'medium', 'high', 'critical'
+    required_level: Optional[str] = None  # ex: "practical", "expert"
+    description: Optional[str] = None  # description textuelle du besoin
+    category: Optional[str] = None  # ex: "backend_framework"
+
+
+class ParsedJobProfile(BaseModel):
+    """
+    Profil structuré complet d'une offre d'emploi après analyse NLP/LLM.
+    """
+    job_id: str
+    title: str
+    requirements: List[JobRequirementItem] = []
+    raw_text: str
+
+
+class CandidateEvidenceItem(BaseModel):
+    """
+    Une preuve trouvée dans le CV pour une ou plusieurs exigences.
+    """
+    evidence_id: str
+    source_section: str  # 'experience', 'education', 'projects', 'summary', 'skills'
+    original_text: str
+    normalized_entities: List[str] = []
+    confidence_score: float = 1.0
+
+
+class ParsedCandidateProfile(BaseModel):
+    """
+    Profil complet du candidat avec preuves structurées.
+    """
+    candidate_id: str
+    cv_info: CandidateCV
+    evidence: List[CandidateEvidenceItem] = []
+    sections: Dict[str, str] = {}  # texte brut par section
+
+
+class RequirementMatchResult(BaseModel):
+    """
+    Résultat du matching pour une exigence spécifique.
+    """
+    requirement_id: str
+    match_type: str  # 'exact', 'semantic', 'unclear', 'missing', 'contradicted'
+    score: float = 0.0
+    found_evidence: List[CandidateEvidenceItem] = []
+    reasoning: str = ""
+    status: str = "pending"  # 'confirmed', 'rejected', 'to_validate' (via chatbot)
+
+
+class EnhancedScreeningResult(BaseModel):
+    """
+    Résultat de screening enrichi basé sur l'analyse par exigences.
+    """
+    candidate_id: str
+    job_id: str
+    overall_score: float
+    requirement_matches: List[RequirementMatchResult] = []
+    summary: str
+    status: str  # 'shortlisted', 'potential', 'rejected'

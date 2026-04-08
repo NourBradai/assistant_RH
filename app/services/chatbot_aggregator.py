@@ -1,114 +1,94 @@
-from app.models.schemas import ChatTurn, ChatbotSession
+"""
+Agrégateur final de score (Screening + Chatbot).
+Met à jour les résultats de matching par exigence en fonction des réponses fournies par le candidat.
+"""
+from typing import List, Optional
+from app.models.schemas import ChatbotSession, EnhancedScreeningResult, RequirementMatchResult
 
-
-def compute_weighted_chatbot_score(turns: list[ChatTurn]) -> float:
+def finalize_chatbot_session(session: ChatbotSession) -> ChatbotSession:
     """
-    Calcule le score chatbot global à partir des tours analysés.
-    Utilise une moyenne pondérée selon le poids des questions.
+    Calcule le score final en mettant à jour le screening initial 
+    avec les preuves apportées durant le chatbot.
     """
-    if not turns:
-        return 0.0
+    if not session.initial_screening:
+        session.status = "completed"
+        return session
 
-    weighted_sum = 0.0
-    total_weight = 0.0
-
-    for turn in turns:
-        if not turn.analysis:
-            continue
-
-        question_weight = turn.question.weight
-        answer_score = turn.analysis.final_answer_score
-
-        weighted_sum += answer_score * question_weight
-        total_weight += question_weight
-
-    if total_weight == 0:
-        return 0.0
-
-    return round(weighted_sum / total_weight, 2)
-
-
-def compute_final_score(
-    initial_score: float,
-    chatbot_score: float,
-    screening_weight: float = 0.7,
-    chatbot_weight: float = 0.3,
-) -> float:
-    """
-    Combine le score initial du screening et le score du chatbot.
-    """
-    final_score = (screening_weight * initial_score) + (chatbot_weight * chatbot_score)
-    return round(final_score, 2)
-
-
-def get_final_decision(final_score: float) -> str:
-    """
-    Transforme le score final en décision finale.
-    """
-    if final_score >= 75:
-        return "recommended"
-    if final_score >= 55:
-        return "review"
-    return "rejected"
-
-
-def count_answered_turns(turns: list[ChatTurn]) -> int:
-    """
-    Compte le nombre de tours effectivement répondus.
-    """
-    count = 0
-    for turn in turns:
-        if turn.answer_text and turn.analysis:
-            count += 1
-    return count
-
-
-def build_recruiter_summary(session: ChatbotSession) -> str:
-    """
-    Construit un résumé synthétique pour le recruteur.
-    """
-    answered_turns = count_answered_turns(session.turns)
-
-    if answered_turns == 0:
-        return "Aucune réponse exploitable n’a été fournie par le candidat durant la phase chatbot."
-
-    strong_answers = 0
-    weak_answers = 0
+    # Copie profonde pour ne pas altérer l'original si nécessaire
+    screening: EnhancedScreeningResult = session.initial_screening
+    
+    # On crée une map des exigences pour un accès rapide
+    req_matches = {res.requirement_id: res for res in screening.requirement_matches}
+    
+    total_chatbot_score = 0.0
+    answered_turns = 0  # Tous les tours avec une analyse valide
+    req_answered_turns = 0  # Spécifiquement ceux ciblant une exigence
 
     for turn in session.turns:
         if not turn.analysis:
             continue
 
-        score = turn.analysis.final_answer_score
-        if score >= 70:
-            strong_answers += 1
-        elif score < 40:
-            weak_answers += 1
+        analysis = turn.analysis
+        final_score = analysis.final_answer_score or 0.0
+        total_chatbot_score += final_score
+        answered_turns += 1
 
-    return (
-        f"Le candidat a répondu à {answered_turns} question(s). "
-        f"{strong_answers} réponse(s) sont jugées solides, "
-        f"{weak_answers} réponse(s) sont jugées faibles. "
-        f"Le score chatbot est de {session.chatbot_score}/100 "
-        f"et le score final est de {session.final_score}/100."
-    )
+        # Mise à jour de l'exigence ciblée si applicable
+        req_id = turn.question.target_requirement_id
+        if req_id and req_id in req_matches:
+            req_answered_turns += 1
+            current_match = req_matches[req_id]
 
+            # Confiance apportée par la réponse orale (0-100 → 0-1)
+            # Fallback: si updated_requirement_confidence est absent ou 0, on utilise final_answer_score
+            raw_conf = analysis.updated_requirement_confidence
+            if raw_conf and raw_conf > 0:
+                chatbot_conf = raw_conf / 100.0
+            else:
+                chatbot_conf = final_score / 100.0  # Fallback mode mock
 
-def finalize_chatbot_session(session: ChatbotSession) -> ChatbotSession:
-    """
-    Met à jour la session avec :
-    - chatbot_score
-    - final_score
-    - final_decision
-    - status
-    """
-    chatbot_score = compute_weighted_chatbot_score(session.turns)
-    final_score = compute_final_score(session.initial_score, chatbot_score)
-    final_decision = get_final_decision(final_score)
+            if chatbot_conf > current_match.score:
+                current_match.score = round(chatbot_conf, 2)
+                current_match.reasoning += " [Confirmé par chatbot]"
 
-    session.chatbot_score = chatbot_score
-    session.final_score = final_score
-    session.final_decision = final_decision
+            if chatbot_conf >= 0.8:
+                current_match.match_type = "exact"
+                current_match.status = "confirmed"
+
+    # Score chatbot = moyenne pondérée sur toutes les réponses fournies
+    session.chatbot_score = round(total_chatbot_score / answered_turns, 2) if answered_turns > 0 else 0.0
+
+    # Score global = moyenne des scores de chaque exigence (mis à jour)
+    n_reqs = len(screening.requirement_matches)
+    final_overall_score = (sum(r.score for r in screening.requirement_matches) / n_reqs * 100) if n_reqs > 0 else 0.0
+    session.final_score = round(final_overall_score, 2)
+    session.initial_screening = screening # Mis à jour
+    
+    # Décision finale
+    if session.final_score >= 75:
+        session.final_decision = "recommended"
+    elif session.final_score >= 50:
+        session.final_decision = "review"
+    else:
+        session.final_decision = "rejected"
+        
     session.status = "completed"
-
     return session
+
+def build_recruiter_summary(session: ChatbotSession) -> str:
+    """
+    Génère un résumé textuel des points validés par le chatbot.
+    """
+    if not session.initial_screening:
+        return "Pas de screening initial trouvé."
+        
+    confirmed = [r for r in session.initial_screening.requirement_matches if "[Confirmé par chatbot]" in r.reasoning]
+    
+    summary = f"Entretien terminé. Score final : {session.final_score}/100. "
+    if confirmed:
+        labels = [r.requirement_id for r in confirmed] # Faire mieux en prod avec les labels
+        summary += f"Le candidat a réussi à clarifier/confirmer {len(confirmed)} point(s) d'ombre."
+    else:
+        summary += "Le chatbot n'a pas permis de lever d'ambiguïtés majeures."
+        
+    return summary

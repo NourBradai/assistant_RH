@@ -1,375 +1,452 @@
+"""
+AI Recruitment Assistant — Frontend Streamlit
+Architecture : Requirement-Driven NLP/LLM Matching Engine
+"""
 import requests
 import streamlit as st
 from typing import Any
 
-# =========================
-# CONFIG
-# =========================
 BACKEND_URL = "http://127.0.0.1:8000"
 
 st.set_page_config(
     page_title="AI Recruitment Assistant",
-    page_icon="📄",
-    layout="wide"
+    page_icon="🤖",
+    layout="wide",
+    initial_sidebar_state="collapsed"
 )
 
-# =========================
-# SESSION STATE INIT
-# =========================
-default_state = {
-    "job_response": None,
-    "candidate_response": None,
-    "screening_response": None,
-    "chatbot_start_response": None,
-    "chatbot_final_response": None,
+# --- CSS CUSTOM ---
+st.markdown("""
+<style>
+    .main-header { font-size: 2.2rem; font-weight: 800; color: #4F46E5; }
+    .section-badge { display:inline-block; background:#EEF2FF; color:#4F46E5;
+                     border-radius:8px; padding:2px 10px; font-size:0.85rem;
+                     font-weight:600; margin-bottom:8px; }
+    .req-card { background:#F9FAFB; border-left:4px solid #4F46E5;
+                border-radius:8px; padding:10px 16px; margin:6px 0; }
+    .match-exact  { border-left-color:#10B981; }
+    .match-semantic { border-left-color:#F59E0B; }
+    .match-unclear  { border-left-color:#EF4444; }
+    .match-missing  { border-left-color:#6B7280; }
+    .imp-critical { color:#DC2626; font-weight:700; }
+    .imp-high     { color:#EA580C; font-weight:600; }
+    .imp-medium   { color:#CA8A04; }
+    .imp-low      { color:#6B7280; }
+    .score-pill   { display:inline-block; background:#4F46E5; color:#fff;
+                    border-radius:999px; padding:2px 12px; font-size:0.8rem; }
+    .chat-bubble-bot  { background:#EEF2FF; border-radius:12px 12px 12px 2px;
+                         padding:10px 16px; margin-bottom:8px; }
+    .chat-bubble-user { background:#E0F2FE; border-radius:12px 12px 2px 12px;
+                         padding:10px 16px; margin-bottom:8px; text-align:right; }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ──────────────────────────────────────────────────────────────
+# SESSION STATE
+# ──────────────────────────────────────────────────────────────
+defaults = {
+    "job_profile": None,      # ParsedJobProfile dict
+    "candidate_profile": None, # ParsedCandidateProfile dict
+    "screening_result": None,  # EnhancedScreeningResult dict
+    "chatbot_session": None,
     "current_question": None,
+    "chat_history": [],
     "job_id": "",
     "candidate_id": "",
     "session_id": "",
-    "chat_history": [],
 }
+for k, v in defaults.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
-for key, value in default_state.items():
-    if key not in st.session_state:
-        st.session_state[key] = value
 
-
-# =========================
-# HELPERS
-# =========================
-def handle_response(response: requests.Response) -> dict[str, Any]:
-    """
-    Gère proprement la réponse HTTP.
-    """
+# ──────────────────────────────────────────────────────────────
+# API HELPERS
+# ──────────────────────────────────────────────────────────────
+def handle(r: requests.Response) -> dict:
     try:
-        data = response.json()
+        data = r.json()
     except Exception:
-        data = {"detail": response.text}
-
-    if response.status_code >= 400:
-        raise Exception(data.get("detail", f"Erreur {response.status_code}"))
-
+        data = {"detail": r.text}
+    if r.status_code >= 400:
+        raise Exception(data.get("detail", f"HTTP {r.status_code}"))
     return data
 
+def post(endpoint, json_data=None, files=None) -> dict:
+    return handle(requests.post(f"{BACKEND_URL}{endpoint}", json=json_data, files=files))
 
-def api_post(endpoint: str, json_data: dict | None = None, files=None) -> dict[str, Any]:
-    """
-    Envoie une requête POST au backend.
-    """
-    url = f"{BACKEND_URL}{endpoint}"
-    response = requests.post(url, json=json_data, files=files)
-    return handle_response(response)
+def get(endpoint, params=None) -> dict:
+    return handle(requests.get(f"{BACKEND_URL}{endpoint}", params=params))
 
 
-def api_get(endpoint: str, params: dict | None = None) -> dict[str, Any]:
-    """
-    Envoie une requête GET au backend.
-    """
-    url = f"{BACKEND_URL}{endpoint}"
-    response = requests.get(url, params=params)
-    return handle_response(response)
+# ──────────────────────────────────────────────────────────────
+# COMPOSANTS UI
+# ──────────────────────────────────────────────────────────────
+def importance_badge(importance: str) -> str:
+    classes = {"critical": "imp-critical", "high": "imp-high",
+               "medium": "imp-medium", "low": "imp-low"}
+    icons   = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "⚪"}
+    return f'<span class="{classes.get(importance, "")}"> {icons.get(importance, "")} {importance.upper()}</span>'
+
+def render_requirement_card(req: dict):
+    label     = req.get("label", "?")
+    req_type  = req.get("type", "skill")
+    importance = req.get("importance", "medium")
+    level     = req.get("required_level", "")
+    category  = req.get("category", "")
+    desc      = req.get("description", "")
+    st.markdown(
+        f"""<div class="req-card">
+            <strong>{label}</strong>
+            &nbsp;{importance_badge(importance)}
+            &nbsp;<span style="color:#6B7280;font-size:0.8rem">{req_type}{' · ' + category if category else ''}</span><br>
+            {('<small>' + level + '</small><br>') if level else ''}
+            {('<small style="color:#6B7280">' + desc + '</small>') if desc else ''}
+        </div>""",
+        unsafe_allow_html=True
+    )
+
+def render_match_card(req_label: str, match: dict):
+    m_type  = match.get("match_type", "missing")
+    score   = match.get("score", 0)
+    reason  = match.get("reasoning", "")
+    status  = match.get("status", "pending")
+
+    icons  = {"exact": "✅", "semantic": "🟡", "unclear": "❓", "missing": "⛔"}
+    labels = {"exact": "Correspondance exacte", "semantic": "Match sémantique",
+              "unclear": "Ambigu", "missing": "Absent"}
+
+    st.markdown(
+        f"""<div class="req-card match-{m_type}">
+            <strong>{icons.get(m_type,'?')} {req_label}</strong>
+            &nbsp;<span class="score-pill">{int(score*100)}%</span>
+            &nbsp;<span style="font-size:0.8rem;color:#6B7280">{labels.get(m_type,m_type)}</span><br>
+            <small style="color:#6B7280">{reason}</small><br>
+            <small><em>Statut : {status}</em></small>
+        </div>""",
+        unsafe_allow_html=True
+    )
 
 
-def show_json_block(title: str, data: Any):
-    """
-    Affiche joliment un bloc JSON.
-    """
-    st.subheader(title)
-    st.json(data)
-
-
-def show_success_message(message: str):
-    st.success(message)
-
-
-def show_error_message(error: Exception):
-    st.error(str(error))
-
-
-# =========================
+# ──────────────────────────────────────────────────────────────
 # HEADER
-# =========================
-st.title("📄 AI Recruitment Assistant")
-st.markdown(
-    """
-Cette interface permet de tester tout le pipeline :
-1. création de l'offre,
-2. upload du CV,
-3. screening initial,
-4. entretien chatbot,
-5. recommandation finale.
-"""
-)
+# ──────────────────────────────────────────────────────────────
+st.markdown('<p class="main-header">🤖 AI Recruitment Assistant</p>', unsafe_allow_html=True)
+st.markdown("**Moteur de sélection piloté par les exigences** — Analyse intelligente NLP/LLM")
+st.divider()
 
-# =========================
-# LAYOUT
-# =========================
+# ──────────────────────────────────────────────────────────────
+# LAYOUT PRINCIPAL
+# ──────────────────────────────────────────────────────────────
 col_left, col_right = st.columns([1, 1])
 
-# ============================================================
-# LEFT COLUMN — JOB + CV + SCREENING
-# ============================================================
+# ══════════════════════════════════════════════════════════════
+# COLONNE GAUCHE — Job / CV / Screening
+# ══════════════════════════════════════════════════════════════
 with col_left:
-    st.header("1) Offre d'emploi")
 
-    with st.form("job_form"):
-        job_id = st.text_input("Job ID", value="job_001")
-        title = st.text_input("Titre du poste", value="Backend Python Developer")
+    # ── STEP 1: Job Parser ──
+    st.markdown('<span class="section-badge">Étape 1</span>', unsafe_allow_html=True)
+    st.subheader("Offre d'emploi → Parsing automatique")
 
-        required_skills_raw = st.text_area(
-            "Compétences obligatoires (séparées par des virgules)",
-            value="Python, FastAPI, SQL"
+    with st.expander("📝 Coller le texte de l'offre d'emploi", expanded=True):
+        raw_job_text = st.text_area(
+            "Texte brut de l'offre",
+            height=180,
+            placeholder="Ex: Nous recherchons un Développeur Backend Senior maîtrisant FastAPI, Docker...",
+            label_visibility="collapsed"
         )
-        preferred_skills_raw = st.text_area(
-            "Compétences souhaitées (séparées par des virgules)",
-            value="Docker, Git, Linux"
-        )
+        col_jid, col_jbtn = st.columns([1, 1])
+        with col_jid:
+            job_id_input = st.text_input("Job ID (optionnel)", placeholder="job_001")
+        with col_jbtn:
+            st.write("")
+            parse_job_btn = st.button("🔍 Analyser ou Charger", use_container_width=True)
 
-        minimum_degree = st.text_input("Diplôme minimum", value="Licence")
-        minimum_experience_years = st.number_input(
-            "Expérience minimale (années)",
-            min_value=0.0,
-            value=2.0,
-            step=0.5
-        )
+    if parse_job_btn:
+        if raw_job_text.strip():
+            with st.spinner("Extraction des exigences en cours..."):
+                try:
+                    # On appelle POST /jobs/parse avec le texte brut via un query param
+                    r = requests.post(
+                        f"{BACKEND_URL}/jobs/parse",
+                        params={"raw_text": raw_job_text}
+                    )
+                    result = handle(r)
+                    profile = result.get("profile", result)
+                    st.session_state.job_profile = profile
+                    st.session_state.job_id = profile.get("job_id", job_id_input)
+                    st.success(f"✅ Offre analysée : **{profile.get('title', '?')}**")
+                except Exception as e:
+                    st.error(str(e))
+        elif job_id_input.strip():
+            with st.spinner("Chargement de l'offre existante..."):
+                try:
+                    r = requests.get(f"{BACKEND_URL}/jobs/{job_id_input.strip()}")
+                    profile = handle(r)
+                    st.session_state.job_profile = profile
+                    st.session_state.job_id = profile.get("job_id", job_id_input.strip())
+                    st.success(f"✅ Offre chargée depuis la BDD : **{profile.get('title', '?')}**")
+                except Exception as e:
+                    st.error(f"Offre introuvable ou erreur : {str(e)}")
+        else:
+            st.warning("Veuillez coller le texte de l'offre ou entrer un Job ID existant.")
 
-        required_languages_raw = st.text_input(
-            "Langues requises (séparées par des virgules)",
-            value="English"
-        )
-        preferred_languages_raw = st.text_input(
-            "Langues souhaitées (séparées par des virgules)",
-            value="French"
-        )
-
-        location = st.text_input("Localisation", value="Tunis")
-        employment_type = st.text_input("Type de poste", value="Full-time")
-
-        submit_job = st.form_submit_button("Créer l'offre")
-
-    if submit_job:
-        try:
-            payload = {
-                "job_id": job_id,
-                "title": title,
-                "required_skills": [x.strip() for x in required_skills_raw.split(",") if x.strip()],
-                "preferred_skills": [x.strip() for x in preferred_skills_raw.split(",") if x.strip()],
-                "minimum_degree": minimum_degree,
-                "minimum_experience_years": minimum_experience_years,
-                "required_languages": [x.strip() for x in required_languages_raw.split(",") if x.strip()],
-                "preferred_languages": [x.strip() for x in preferred_languages_raw.split(",") if x.strip()],
-                "location": location,
-                "employment_type": employment_type,
-                "weights": {
-                    "required_skills": 40,
-                    "preferred_skills": 15,
-                    "experience": 20,
-                    "degree": 10,
-                    "languages": 10,
-                    "projects_certifications": 5
-                }
-            }
-
-            result = api_post("/jobs/", json_data=payload)
-            st.session_state.job_response = result
-            st.session_state.job_id = payload["job_id"]
-            show_success_message("Offre créée avec succès.")
-        except Exception as e:
-            show_error_message(e)
-
-    if st.session_state.job_response:
-        show_json_block("Offre créée", st.session_state.job_response)
+    if st.session_state.job_profile:
+        profile = st.session_state.job_profile
+        st.markdown(f"**Poste** : {profile.get('title', '?')} — `{profile.get('job_id', '?')}`")
+        reqs = profile.get("requirements", [])
+        if reqs:
+            st.markdown(f"**{len(reqs)} exigences extraites** :")
+            for req in reqs:
+                render_requirement_card(req)
+        else:
+            st.info("Aucune exigence extraite (LLM non configuré — mode mock).")
 
     st.divider()
 
-    st.header("2) Upload du CV")
+    # ── STEP 2: CV Upload ──
+    st.markdown('<span class="section-badge">Étape 2</span>', unsafe_allow_html=True)
+    st.subheader("CV du candidat → Profiling par sections")
 
-    uploaded_file = st.file_uploader("Choisir un CV PDF", type=["pdf"])
+    uploaded_file = st.file_uploader("Charger un CV (PDF)", type=["pdf"])
 
-    if st.button("Uploader le CV", use_container_width=True):
+    if st.button("📄 Uploader et analyser le CV", use_container_width=True):
         if not uploaded_file:
-            st.warning("Veuillez choisir un PDF.")
+            st.warning("Choisissez un PDF.")
         else:
-            try:
-                files = {
-                    "file": (uploaded_file.name, uploaded_file.getvalue(), "application/pdf")
-                }
-                result = api_post("/cvs/upload", files=files)
+            with st.spinner("Extraction du profil candidat..."):
+                try:
+                    files = {"file": (uploaded_file.name, uploaded_file.getvalue(), "application/pdf")}
+                    result = post("/cvs/upload", files=files)
+                    profile = result.get("profile", result)
+                    st.session_state.candidate_profile = profile
+                    cv_info = profile.get("cv_info", profile.get("candidate", {}))
+                    st.session_state.candidate_id = cv_info.get("candidate_id", profile.get("candidate_id", ""))
+                    st.success(f"✅ CV analysé : **{cv_info.get('name', 'Candidat')}**")
+                except Exception as e:
+                    st.error(str(e))
 
-                st.session_state.candidate_response = result
-                candidate = result.get("candidate", {})
-                st.session_state.candidate_id = candidate.get("candidate_id", "")
+    if st.session_state.candidate_profile:
+        profile = st.session_state.candidate_profile
+        cv = profile.get("cv_info", profile)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Expérience", f"{cv.get('experience_years', 0)} ans")
+        c2.metric("Diplôme", cv.get("degree", "N/D"))
+        c3.metric("Compétences", len(cv.get("skills", [])))
 
-                show_success_message("CV uploadé et parsé avec succès.")
-            except Exception as e:
-                show_error_message(e)
-
-    if st.session_state.candidate_response:
-        show_json_block("Candidat parsé", st.session_state.candidate_response)
+        with st.expander("🔍 Preuves extraites par section"):
+            for ev in profile.get("evidence", []):
+                section = ev.get("source_section", "?")
+                entities = ", ".join(ev.get("normalized_entities", [])) or "Aucune entité"
+                conf = ev.get("confidence_score", 0)
+                st.markdown(f"**{section.upper()}** — Confiance {int(conf*100)}%")
+                st.caption(ev.get("original_text", "")[:300])
+                st.code(entities, language=None)
 
     st.divider()
 
-    st.header("3) Screening initial")
+    # ── STEP 3: Matching ──
+    st.markdown('<span class="section-badge">Étape 3</span>', unsafe_allow_html=True)
+    st.subheader("Matching par exigences")
 
-    if st.button("Lancer le screening", use_container_width=True):
-        if not st.session_state.job_id or not st.session_state.candidate_id:
-            st.warning("Il faut d'abord créer une offre et uploader un CV.")
-        else:
+    match_btn = st.button("⚡ Lancer le matching sémantique", use_container_width=True,
+                          disabled=not (st.session_state.job_id and st.session_state.candidate_id))
+
+    if match_btn:
+        with st.spinner("Analyse sémantique en cours..."):
             try:
-                # FIX: Utiliser la route correcte avec path parameters
-                endpoint = f"/screening/jobs/{st.session_state.job_id}/match/{st.session_state.candidate_id}"
-                result = api_get(endpoint)
-                st.session_state.screening_response = result
-                show_success_message("Screening effectué avec succès.")
+                result = get(f"/screening/jobs/{st.session_state.job_id}/match/{st.session_state.candidate_id}")
+                st.session_state.screening_result = result
+                st.success(f"✅ Score global : **{result.get('overall_score', 0)}%** — Statut : {result.get('status', '?')}")
             except Exception as e:
-                show_error_message(e)
+                st.error(str(e))
 
-    if st.session_state.screening_response:
-        show_json_block("Résultat du screening", st.session_state.screening_response)
+    if st.session_state.screening_result:
+        sr = st.session_state.screening_result
+        score = sr.get("overall_score", 0)
 
-# ============================================================
-# RIGHT COLUMN — CHATBOT + FINAL RESULT
-# ============================================================
+        # Barre de progression
+        color = "#10B981" if score >= 75 else "#F59E0B" if score >= 40 else "#EF4444"
+        st.markdown(
+            f"""<div style="background:#F3F4F6;border-radius:8px;height:16px;margin-bottom:12px">
+                <div style="background:{color};width:{score}%;height:100%;border-radius:8px"></div>
+            </div><small style="color:{color};font-weight:600">Score : {score}%</small>""",
+            unsafe_allow_html=True
+        )
+
+        st.caption(sr.get("summary", ""))
+
+        st.markdown("**Détail par exigence :**")
+
+        # Récupérer les labels des exigences depuis le profil job pour l'affichage
+        req_labels = {
+            r["requirement_id"]: r["label"]
+            for r in (st.session_state.job_profile or {}).get("requirements", [])
+        } if st.session_state.job_profile else {}
+
+        for match in sr.get("requirement_matches", []):
+            req_id = match.get("requirement_id", "?")
+            label = req_labels.get(req_id, req_id)
+            render_match_card(label, match)
+
+
+# ══════════════════════════════════════════════════════════════
+# COLONNE DROITE — Chatbot + Résultat Final
+# ══════════════════════════════════════════════════════════════
 with col_right:
-    st.header("4) Chatbot de présélection")
 
-    if st.button("Démarrer le chatbot", use_container_width=True):
-        if not st.session_state.job_id or not st.session_state.candidate_id:
-            st.warning("Il faut d'abord créer une offre et uploader un CV.")
-        else:
+    # ── STEP 4: Chatbot ──
+    st.markdown('<span class="section-badge">Étape 4</span>', unsafe_allow_html=True)
+    st.subheader("Chatbot de validation contextuel")
+
+    has_screening = st.session_state.screening_result is not None
+    start_btn = st.button(
+        "💬 Démarrer le chatbot",
+        use_container_width=True,
+        disabled=not has_screening,
+        help="Le screening initial doit être effectué avant de démarrer."
+    )
+
+    if start_btn:
+        with st.spinner("Initialisation du chatbot..."):
             try:
                 payload = {
                     "job_id": st.session_state.job_id,
                     "candidate_id": st.session_state.candidate_id
                 }
-                result = api_post("/chatbot/start", json_data=payload)
-
-                st.session_state.chatbot_start_response = result
+                result = post("/chatbot/start", json_data=payload)
+                st.session_state.chatbot_session = result
                 st.session_state.session_id = result.get("session_id", "")
-                st.session_state.current_question = result.get("question", None)
+                
+                # La première question peut être dans first_question ou question
+                q = result.get("first_question") or result.get("question")
+                st.session_state.current_question = q
                 st.session_state.chat_history = []
-
-                show_success_message("Session chatbot démarrée.")
+                st.success(f"Session démarrée — {result.get('total_questions', '?')} question(s) ciblées")
             except Exception as e:
-                show_error_message(e)
+                st.error(str(e))
 
-    if st.session_state.chatbot_start_response:
-        show_json_block("Session chatbot", st.session_state.chatbot_start_response)
+    if st.session_state.chatbot_session:
+        s = st.session_state.chatbot_session
+        nb_q = s.get("total_questions", "?")
+        st.caption(f"Session `{st.session_state.session_id[:12]}...` — {nb_q} question(s)")
 
     st.divider()
 
-    st.header("5) Répondre aux questions")
+    # ── STEP 5: Répondre ──
+    st.markdown('<span class="section-badge">Étape 5</span>', unsafe_allow_html=True)
+    st.subheader("Questions contextuelles")
 
     session_id = st.session_state.session_id
-    current_question = st.session_state.current_question
+    current_q = st.session_state.current_question
 
-    if session_id and current_question:
-        st.markdown("### Question actuelle")
-        st.info(current_question.get("question_text", "Aucune question"))
+    if session_id and current_q:
+        # Afficher la question dans une bulle
+        st.markdown(
+            f'<div class="chat-bubble-bot">🤖 <strong>Question</strong><br>{current_q.get("question_text", "")}</div>',
+            unsafe_allow_html=True
+        )
+
+        # Afficher la cible de la question si disponible
+        target_req = current_q.get("target_requirement_id")
+        req_labels = {
+            r["requirement_id"]: r["label"]
+            for r in (st.session_state.job_profile or {}).get("requirements", [])
+        } if st.session_state.job_profile else {}
+        if target_req and target_req in req_labels:
+            st.caption(f"🎯 Cette question valide : **{req_labels[target_req]}**")
 
         with st.form("answer_form", clear_on_submit=True):
-            answer_text = st.text_area("Votre réponse")
-            submit_answer = st.form_submit_button("Envoyer la réponse")
+            answer_text = st.text_area("Votre réponse", height=80, label_visibility="collapsed",
+                                       placeholder="Décrivez votre expérience en détail...")
+            submit = st.form_submit_button("📤 Envoyer", use_container_width=True)
 
-        if submit_answer:
+        if submit:
             if not answer_text.strip():
-                st.warning("Veuillez saisir une réponse.")
+                st.warning("Réponse vide.")
             else:
-                try:
-                    payload = {
-                        "session_id": session_id,
-                        "answer_text": answer_text
-                    }
+                with st.spinner("Analyse de la réponse..."):
+                    try:
+                        payload = {"session_id": session_id, "answer_text": answer_text}
+                        result = post("/chatbot/answer", json_data=payload)
 
-                    result = api_post("/chatbot/answer", json_data=payload)
+                        # On stocke la réponse dans l'historique
+                        if current_q:
+                            st.session_state.chat_history.append({
+                                "question": current_q,
+                                "answer_text": answer_text
+                            })
 
-                    last_turn = result.get("last_turn")
-                    if last_turn:
-                        st.session_state.chat_history.append(last_turn)
+                        # Prochaine question ou fin
+                        next_q = result.get("next_question")
+                        st.session_state.current_question = next_q
 
-                    st.session_state.current_question = result.get("next_question", None)
-                    
-                    if result.get("status") == "completed":
-                        st.session_state.chatbot_final_response = {
-                            "session_id": result.get("session_id"),
-                            "status": result.get("status"),
-                            "chatbot_score": result.get("chatbot_score"),
-                            "final_score": result.get("final_score"),
-                            "final_decision": result.get("final_decision"),
-                            "recruiter_summary": result.get("recruiter_summary"),
-                            "last_turn": result.get("last_turn"),
-                        }
-                        show_success_message("Dernière réponse enregistrée. Session terminée.")
-                    else:
-                        show_success_message("Réponse enregistrée.")
-                    
-                    st.rerun()
-                except Exception as e:
-                    show_error_message(e)
-    elif session_id and not current_question:
-        st.info("Aucune question en attente ou session terminée.")
+                        if result.get("status") == "completed" or result.get("final_score") is not None:
+                            st.session_state.chatbot_final = result
+                            st.success("✅ Entretien terminé.")
+
+                        st.rerun()
+                    except Exception as e:
+                        st.error(str(e))
+
+    elif session_id and not current_q:
+        st.info("✅ Toutes les questions ont été traitées.")
     else:
-        st.caption("Le chatbot n'a pas encore été démarré.")
+        st.caption("_Démarrez le chatbot pour commencer l'entretien._")
 
+    # Historique des échanges
     if st.session_state.chat_history:
-        st.markdown("### Historique des échanges")
-        for idx, turn in enumerate(st.session_state.chat_history, start=1):
-            st.markdown(f"**Q{idx}** : {turn['question']['question_text']}")
-            st.write(f"**Réponse** : {turn.get('answer_text', '')}")
-            analysis = turn.get("analysis")
-            if analysis:
-                st.caption(
-                    f"Score réponse : {analysis.get('final_answer_score', 0)} | "
-                    f"Pertinence : {analysis.get('relevance_score', 0)} | "
-                    f"Preuve : {analysis.get('evidence_score', 0)} | "
-                    f"Clarté : {analysis.get('clarity_score', 0)} | "
-                    f"Position : {analysis.get('stance_score', 0)}"
-                )
-                st.caption(f"Justification : {analysis.get('justification', '')}")
-            st.markdown("---")
+        st.markdown("#### Historique")
+        for i, turn in enumerate(st.session_state.chat_history, 1):
+            q_text = turn.get("question", {}).get("question_text", "")
+            a_text = turn.get("answer_text", "")
+            st.markdown(
+                f'<div class="chat-bubble-bot"><strong>Q{i}.</strong> {q_text}</div>'
+                f'<div class="chat-bubble-user">✍️ {a_text}</div>',
+                unsafe_allow_html=True
+            )
 
     st.divider()
 
-    st.header("6) Résultat final")
+    # ── STEP 6: Résultat Final ──
+    st.markdown('<span class="section-badge">Étape 6</span>', unsafe_allow_html=True)
+    st.subheader("Décision finale")
 
-    if st.button("Récupérer le résultat final", use_container_width=True):
-        if not st.session_state.session_id:
-            st.warning("Aucune session chatbot active.")
-        else:
-            try:
-                result = api_get(
-                    "/chatbot/final",
-                    params={"session_id": st.session_state.session_id}
-                )
-                st.session_state.chatbot_final_response = result
-                show_success_message("Résultat final récupéré.")
-            except Exception as e:
-                show_error_message(e)
+    get_result_btn = st.button("📊 Voir le résultat final", use_container_width=True,
+                               disabled=not session_id)
+    if get_result_btn:
+        try:
+            result = get(f"/chatbot/status/{session_id}")
+            st.session_state.chatbot_final = result
+        except Exception as e:
+            st.error(str(e))
 
-    if st.session_state.chatbot_final_response:
-        result = st.session_state.chatbot_final_response
+    final = getattr(st.session_state, "chatbot_final", None) or st.session_state.get("chatbot_final")
 
-        st.subheader("Décision finale")
-        final_decision = result.get("final_decision", "pending")
-        final_score = result.get("final_score", 0)
-        chatbot_score = result.get("chatbot_score", 0)
+    if final:
+        decision   = final.get("final_decision", "pending")
+        final_score = final.get("final_score", 0)
+        chatbot_score = final.get("chatbot_score", 0)
+        initial_score = final.get("initial_score", st.session_state.screening_result.get("overall_score", 0) if st.session_state.screening_result else 0)
 
-        if final_decision == "recommended":
-            st.success(f"Décision : {final_decision}")
-        elif final_decision == "review":
-            st.warning(f"Décision : {final_decision}")
-        else:
-            st.error(f"Décision : {final_decision}")
+        decision_colors = {"recommended": "success", "review": "warning", "rejected": "error", "pending": "info"}
+        decision_icons  = {"recommended": "🟢", "review": "🟡", "rejected": "🔴", "pending": "🔵"}
+        getattr(st, decision_colors.get(decision, "info"))(
+            f"{decision_icons.get(decision, '?')} Décision : **{decision.upper()}**"
+        )
 
-        c1, c2 = st.columns(2)
-        with c1:
-            st.metric("Score chatbot", chatbot_score)
-        with c2:
-            st.metric("Score final", final_score)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Score Initial", f"{initial_score:.1f}%")
+        c2.metric("Score Chatbot", f"{chatbot_score:.1f}%")
+        c3.metric("Score Final", f"{final_score:.1f}%", delta=f"+{final_score - initial_score:.1f}%" if final_score > initial_score else None)
 
-        recruiter_summary = result.get("recruiter_summary")
-        if recruiter_summary:
-            st.markdown("### Résumé recruteur")
-            st.write(recruiter_summary)
+        summary = final.get("summary")
+        if not summary and final.get("initial_screening"):
+            summary = final["initial_screening"].get("summary")
+        if summary:
+            st.info(f"📝 {summary}")
 
-        show_json_block("Résultat final complet", result)
+        with st.expander("Détail complet de la session"):
+            st.json(final)

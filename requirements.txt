@@ -4,3 +4,7 @@ pydantic
 email-validator
 python-multipart
 pymupdf
+sentence-transformers
+httpx
+pytest
+sqlalchemy

@@ -12,6 +12,10 @@ env/
 *.db
 *.sqlite3
 
+# Logs
+*.txt
+*.log
+
 # IDEs
 .vscode/
 .idea/

@@ -1,217 +1,203 @@
-from app.models.schemas import JobRequirement, CandidateCV, ScreeningResult
+"""
+Moteur de matching hybride (NLP + Sémantique).
+Compare les exigences d'un poste (ParsedJobProfile) avec les preuves d'un candidat (ParsedCandidateProfile).
+"""
+import uuid
+import re
+from typing import List, Dict, Optional
+try:
+    from sentence_transformers import SentenceTransformer, util
+    _EMBEDDING_MODEL = SentenceTransformer('all-MiniLM-L6-v2')
+except ImportError:
+    _EMBEDDING_MODEL = None
 
-# Même logique de hiérarchie que dans le parser
+from app.models.schemas import (
+    ParsedJobProfile, 
+    ParsedCandidateProfile, 
+    RequirementMatchResult, 
+    CandidateEvidenceItem,
+    EnhancedScreeningResult,
+    JobRequirementItem
+)
+
 DEGREE_RANK = {
-    "Bac": 1,
-    "Bts": 2,
-    "Dut": 2,
-    "Deust": 2,
-    "Licence": 3,
-    "Bachelor": 3,
-    "M1": 3,
-    "L3": 3,
-    "Master": 4,
-    "Ingénieur": 4,
-    "Engineer": 4,
-    "M2": 4,
-    "Doctorat": 5,
-    "Phd": 5
+    "Bac": 1, "Bts": 2, "Dut": 2, "Deust": 2,
+    "Licence": 3, "Bachelor": 3, "M1": 3, "L3": 3,
+    "Master": 4, "Ingénieur": 4, "Engineer": 4, "M2": 4,
+    "Doctorat": 5, "Phd": 5
 }
 
-
-def normalize_list(values: list[str]) -> list[str]:
+def calculate_semantic_similarity(text1: str, text2: str) -> float:
     """
-    Met une liste en minuscules et supprime les doublons.
-    Sert à comparer proprement les chaînes sans problème de casse.
+    Calcule la similarité cosinus entre deux textes via embeddings.
     """
-    return list({v.strip().lower() for v in values if v and v.strip()})
+    if not _EMBEDDING_MODEL or not text1 or not text2:
+        return 0.0
+    
+    emb1 = _EMBEDDING_MODEL.encode(text1, convert_to_tensor=True)
+    emb2 = _EMBEDDING_MODEL.encode(text2, convert_to_tensor=True)
+    
+    return float(util.cos_sim(emb1, emb2)[0][0])
 
-
-def match_required_skills(job: JobRequirement, candidate: CandidateCV) -> tuple[list[str], list[str]]:
+def match_requirement(requirement: JobRequirementItem, profile: ParsedCandidateProfile) -> RequirementMatchResult:
     """
-    Retourne :
-    - les compétences obligatoires trouvées
-    - les compétences obligatoires manquantes
+    Analyse une exigence spécifique par rapport à l'ensemble du profil candidat.
+    Pipeline de recherche en 3 étapes (du plus précis au plus général) :
+      1. Mot-clé exact dans entités normalisées (SKILL_MAP)
+      2. Mot-clé exact dans le texte brut des sections CV (keyword search)
+      3. Similarité sémantique via embeddings
     """
-    job_required = normalize_list(job.required_skills)
-    candidate_skills = normalize_list(candidate.skills)
+    best_score = 0.0
+    matching_evidence = []
+    match_type = "missing"
+    reasoning = ""
 
-    matched = [skill for skill in job_required if skill in candidate_skills]
-    missing = [skill for skill in job_required if skill not in candidate_skills]
+    req_label = requirement.label
+    req_label_lower = req_label.lower()
 
-    return matched, missing
+    # ── Étape 1 : Exact match via entités normalisées ────────────────────
+    for ev in profile.evidence:
+        if any(req_label_lower == ent.lower() for ent in ev.normalized_entities):
+            match_type = "exact"
+            best_score = 1.0
+            matching_evidence = [ev]
+            reasoning = f"Correspondance exacte (entités normalisées) dans la section '{ev.source_section}'."
+            break
 
+    # ── Étape 2 : Keyword search dans le texte brut ──────────────────────
+    # On cherche le label du job directement comme mot-clé dans le texte du CV.
+    # Cette étape est indépendante du SKILL_MAP — elle fonctionne pour TOUT mot-clé extrait du JD.
+    if match_type != "exact":
+        for ev in profile.evidence:
+            text_lower = ev.original_text.lower()
+            # Recherche par correspondance de mot entier (\b) pour éviter les faux positifs
+            if re.search(r"\b" + re.escape(req_label_lower) + r"\b", text_lower):
+                match_type = "exact"
+                best_score = 1.0
+                matching_evidence = [ev]
+                reasoning = f"Mot-clé '{req_label}' trouvé directement dans la section '{ev.source_section}' du CV."
+                break
 
-def match_preferred_skills(job: JobRequirement, candidate: CandidateCV) -> list[str]:
+    # ── Étape 3 : Similarité sémantique (fallback) ───────────────────────
+    if match_type != "exact":
+        for ev in profile.evidence:
+            sim = calculate_semantic_similarity(req_label, ev.original_text)
+            if sim > 0.4:
+                if sim > best_score:
+                    best_score = sim
+                    matching_evidence = [ev]
+
+        if best_score >= 0.75:
+            match_type = "semantic"
+            reasoning = f"Compétence sémantiquement proche de '{req_label}' identifiée."
+        elif best_score >= 0.4:
+            match_type = "unclear"
+            reasoning = f"Mention indirecte ou ambiguë de '{req_label}'."
+        else:
+            match_type = "missing"
+            reasoning = f"Aucune preuve de '{req_label}' trouvée dans le CV."
+
+    # Gestion spécifique de l'expérience et du diplôme si nécessaire
+    # ── Spécificité : Diplôme (degree) ──────────────────────────────────
+    # Pour les exigences de type 'degree', on applique une logique hiérarchique :
+    # Si le candidat a un diplôme >= au niveau requis → exact match, même si le mot est différent.
+    if requirement.type in ("degree", "education") and match_type != "exact":
+        req_rank = None
+        for deg, rank in DEGREE_RANK.items():
+            if deg.lower() in req_label_lower:
+                req_rank = rank
+                break
+
+        if req_rank is not None:
+            # Cherche le diplôme du candidat dans les sections 'education' / 'formation'
+            for ev in profile.evidence:
+                if ev.source_section.lower() not in ("education", "formation", "studies", "diplome"):
+                    continue
+                ev_text = ev.original_text.lower()
+                for deg, rank in DEGREE_RANK.items():
+                    if deg.lower() in ev_text:
+                        if rank >= req_rank:
+                            match_type = "exact"
+                            best_score = 1.0
+                            matching_evidence = [ev]
+                            reasoning = (
+                                f"Diplôme candidat (niveau {rank}) ≥ exigence (niveau {req_rank})."
+                            )
+                        elif rank == req_rank - 1:
+                            match_type = "unclear"
+                            best_score = max(best_score, 0.5)
+                            matching_evidence = [ev]
+                            reasoning = f"Diplôme candidat (niveau {rank}) légèrement inférieur au requis (niveau {req_rank})."
+                        break
+                if match_type == "exact":
+                    break
+
+    # Statut final pour le chatbot
+    status = "confirmed" if match_type == "exact" else "to_validate"
+    if match_type == "missing":
+        status = "to_validate" if requirement.importance in ["high", "critical"] else "rejected"
+
+    return RequirementMatchResult(
+        requirement_id=requirement.requirement_id,
+        match_type=match_type,
+        score=round(best_score, 2),
+        found_evidence=matching_evidence,
+        reasoning=reasoning,
+        status=status
+    )
+
+def match_job_to_candidate(job: ParsedJobProfile, candidate: ParsedCandidateProfile) -> EnhancedScreeningResult:
     """
-    Retourne les compétences bonus trouvées.
+    Fonction principale : Effectue le matching requirement par requirement.
     """
-    job_preferred = normalize_list(job.preferred_skills)
-    candidate_skills = normalize_list(candidate.skills)
-
-    matched = [skill for skill in job_preferred if skill in candidate_skills]
-    return matched
-
-
-def language_match_score(job: JobRequirement, candidate: CandidateCV) -> tuple[list[str], float]:
-    """
-    Compare les langues requises.
-    Retourne :
-    - les langues trouvées
-    - le score partiel langue
-    """
-    required_languages = normalize_list(job.required_languages)
-    candidate_languages = normalize_list(candidate.languages)
-
-    if not required_languages:
-        return [], 0.0
-
-    matched_languages = [lang for lang in required_languages if lang in candidate_languages]
-    ratio = len(matched_languages) / len(required_languages)
-
-    return matched_languages, ratio
-
-
-def degree_is_valid(candidate_degree: str | None, minimum_degree: str | None) -> bool:
-    """
-    Vérifie si le diplôme du candidat satisfait le minimum demandé.
-    Utilise une recherche par sous-chaîne pour être plus flexible (ex: 'Master en Informatique').
-    """
-    if not minimum_degree:
-        return True
-
-    if not candidate_degree:
-        return False
-
-    # On cherche le rang le plus élevé parmi les mots-clés trouvés dans le diplôme du candidat
-    candidate_rank = 0
-    for deg, rank in DEGREE_RANK.items():
-        if deg.lower() in candidate_degree.lower():
-            candidate_rank = max(candidate_rank, rank)
-
-    # On cherche le rang requis par rapport au job
-    required_rank = 0
-    for deg, rank in DEGREE_RANK.items():
-        if deg.lower() in minimum_degree.lower():
-            required_rank = max(required_rank, rank)
-
-    return candidate_rank >= required_rank
-
-
-def experience_score(candidate_years: float, minimum_years: float) -> float:
-    """
-    Retourne un ratio entre 0 et 1 pour mesurer si l'expérience est suffisante.
-    """
-    if minimum_years <= 0:
-        return 1.0
-
-    ratio = candidate_years / minimum_years
-    return min(ratio, 1.0)
-
-
-def build_strengths(matched_required: list[str], matched_preferred: list[str], degree_ok: bool, experience_ok: bool) -> list[str]:
-    """
-    Construit une liste simple de points forts.
-    """
-    strengths = []
-
-    if matched_required:
-        strengths.append(f"{len(matched_required)} compétence(s) obligatoire(s) validée(s)")
-
-    if matched_preferred:
-        strengths.append(f"{len(matched_preferred)} compétence(s) bonus trouvée(s)")
-
-    if degree_ok:
-        strengths.append("Diplôme compatible avec le poste")
-
-    if experience_ok:
-        strengths.append("Expérience suffisante")
-
-    return strengths
-
-
-def build_weaknesses(missing_required: list[str], degree_ok: bool, experience_ok: bool, matched_languages: list[str], job: JobRequirement) -> list[str]:
-    """
-    Construit une liste simple de points faibles.
-    """
-    weaknesses = []
-
-    if missing_required:
-        weaknesses.append("Compétences obligatoires manquantes : " + ", ".join(missing_required))
-
-    if not degree_ok:
-        weaknesses.append("Diplôme insuffisant ou non détecté")
-
-    if not experience_ok:
-        weaknesses.append("Expérience inférieure au minimum demandé")
-
-    if job.required_languages and len(matched_languages) < len(job.required_languages):
-        weaknesses.append("Certaines langues requises sont absentes")
-
-    return weaknesses
-
-
-def compute_screening_result(job: JobRequirement, candidate: CandidateCV) -> ScreeningResult:
-    """
-    Fonction principale de matching/scoring.
-    Compare un candidat à une offre et retourne un ScreeningResult.
-    """
-    matched_required, missing_required = match_required_skills(job, candidate)
-    matched_preferred = match_preferred_skills(job, candidate)
-    matched_languages, language_ratio = language_match_score(job, candidate)
-
-    degree_ok = degree_is_valid(candidate.degree, job.minimum_degree)
-    exp_ratio = experience_score(candidate.experience_years, job.minimum_experience_years)
-    experience_ok = exp_ratio >= 1.0
-
-    score = 0.0
-
-    # 1. compétences obligatoires
-    if job.required_skills:
-        required_ratio = len(matched_required) / len(job.required_skills)
-        score += required_ratio * job.weights.required_skills
-
-    # 2. compétences bonus
-    if job.preferred_skills:
-        preferred_ratio = len(matched_preferred) / len(job.preferred_skills)
-        score += preferred_ratio * job.weights.preferred_skills
-
-    # 3. expérience
-    score += exp_ratio * job.weights.experience
-
-    # 4. diplôme
-    if degree_ok:
-        score += job.weights.degree
-
-    # 5. langues
-    score += language_ratio * job.weights.languages
-
-    # 6. certifications / projets
-    extra_points = 0.0
-    if candidate.certifications or candidate.projects:
-        extra_points = job.weights.projects_certifications
-    score += extra_points
-
-    strengths = build_strengths(matched_required, matched_preferred, degree_ok, experience_ok)
-    weaknesses = build_weaknesses(missing_required, degree_ok, experience_ok, matched_languages, job)
-
-    if len(missing_required) > 0:
-        status = "review"
-    elif score >= 75:
+    match_results = []
+    total_score = 0.0
+    
+    if not job.requirements:
+        return EnhancedScreeningResult(
+            candidate_id=candidate.candidate_id,
+            job_id=job.job_id,
+            overall_score=0.0,
+            summary="Aucune exigence extraite du poste pour le matching.",
+            status="review"
+        )
+    
+    for req in job.requirements:
+        res = match_requirement(req, candidate)
+        match_results.append(res)
+        
+        # Calcul du score pondéré simplifié
+        # Importance weights: critical=1.5, high=1.2, medium=1.0, low=0.5
+        weight_map = {"critical": 1.5, "high": 1.2, "medium": 1.0, "low": 0.5}
+        w = weight_map.get(req.importance, 1.0)
+        total_score += res.score * w
+        
+    max_possible_score = sum(weight_map.get(req.importance, 1.0) for req in job.requirements)
+    final_score = (total_score / max_possible_score) * 100 if max_possible_score > 0 else 0
+    
+    # Résumé intelligent
+    unclear_count = sum(1 for r in match_results if r.match_type == "unclear")
+    missing_critical = sum(1 for i, r in enumerate(match_results) if r.match_type == "missing" and job.requirements[i].importance == "critical")
+    
+    summary = f"Matching de {len(job.requirements)} critères. "
+    if missing_critical > 0:
+        summary += f"Attention : {missing_critical} critère(s) critique(s) manquant(s). "
+    if unclear_count > 0:
+        summary += f"{unclear_count} point(s) d'ambiguïté à lever par le chatbot."
+    
+    # Statut
+    if final_score >= 80 and missing_critical == 0:
         status = "shortlisted"
-    elif score >= 50:
-        status = "review"
+    elif final_score >= 40:
+        status = "potential"
     else:
         status = "rejected"
-
-    return ScreeningResult(
+        
+    return EnhancedScreeningResult(
         candidate_id=candidate.candidate_id,
         job_id=job.job_id,
-        initial_score=round(score, 2),
-        matched_required_skills=matched_required,
-        missing_required_skills=missing_required,
-        matched_preferred_skills=matched_preferred,
-        strengths=strengths,
-        weaknesses=weaknesses,
+        overall_score=round(final_score, 2),
+        requirement_matches=match_results,
+        summary=summary,
         status=status
     )

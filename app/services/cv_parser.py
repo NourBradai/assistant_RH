@@ -6,8 +6,9 @@ import re
 import uuid
 import datetime
 import fitz
+from typing import Dict, List, Optional
 
-from app.models.schemas import CandidateCV
+from app.models.schemas import CandidateCV, CandidateEvidenceItem, ParsedCandidateProfile
 from app.utils.text_cleaner import clean_text
 
 # --- CONFIGURATION DES LOGIQUES MÉTIER ---
@@ -73,23 +74,92 @@ def extract_phone(text: str) -> str | None:
     match = re.search(r"(\+?\d[\d\s\.\-]{8,}\d)", text)
     return match.group(0).strip() if match else None
 
-def extract_skills(text: str) -> list[str]:
+def extract_skills_from_map(text: str) -> set:
     """
-    Extrait et normalise les compétences.
+    Phase 1 : Extraction via la SKILL_MAP (normalisée).
+    Cherche les patterns prédéfinis n'importe où dans le texte.
     """
-    found_skills = set()
+    found = set()
     text_lower = text.lower()
     for skill_name, patterns in SKILL_MAP.items():
         for pattern in patterns:
             if re.search(r"\b" + pattern + r"\b", text_lower):
-                found_skills.add(skill_name)
+                found.add(skill_name)
                 break
-    return sorted(list(found_skills))
+    return found
+
+
+def extract_free_skills(text: str) -> set:
+    """
+    Phase 2 : Extraction libre des compétences techniques non couverte par SKILL_MAP.
+    """
+    found = set()
+
+    # Mots parasites à exclure (trop génériques, lieux, étiquettes UI)
+    EXCLUDE = {
+        "de", "la", "le", "les", "et", "en", "avec", "sur", "pour", "du", "dans", "par",
+        "the", "and", "or", "with", "using", "of", "in", "at", "by", "to", "for",
+        "une", "un", "des", "au", "aux", "ai", "as", "est",
+        "junior", "senior", "lead", "stage", "projet", "mission", "expérience",
+        "compétences", "skills", "outils", "technologies", "connaissance", "maîtrise",
+        "utilisation", "développement", "conception", "réalisation", "mise", "en", "œuvre",
+        "linkedin", "email", "téléphone", "phone", "adresse", "address", "tunis", "tunisie",
+        "france", "paris", "lyon", "maroc", "algérie", "présent", "present", "now", "today",
+        "janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre", "novembre", "décembre",
+        "january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"
+    }
+
+    # On cible les lignes candidates = listes séparées ou tokens courts
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if not stripped: continue
+        
+        # On ignore les phrases trop longues (probablement du texte narratif)
+        if len(stripped.split()) > 15: continue
+        
+        # Séparation par de nombreux délimiteurs
+        tokens = re.split(r"[,;/|•·▪▸\-–—\n\t:]+", stripped)
+        for token in tokens:
+            token = token.strip().strip("()[].*")
+            
+            # Filtre heuristique : 
+            # - Longueur raisonnable
+            # - Pas que des chiffres
+            # - Pas un lien URL
+            # - Pas dans la blacklist
+            if (
+                2 <= len(token) <= 25
+                and re.search(r"[A-Za-z]", token)
+                and not re.search(r"(http|www|\.com|\.fr|\.net)", token.lower())
+                and token.lower() not in EXCLUDE
+            ):
+                # On évite les tokens qui sont des phrases entières
+                if len(token.split()) <= 3:
+                    found.add(token)
+
+    # Supprimer les tokens qui sont déjà couverts par la SKILL_MAP
+    map_values_lower = {v.lower() for v in SKILL_MAP.keys()}
+    found = {s for s in found if s.lower() not in map_values_lower}
+
+    return found
+
+
+def extract_skills(text: str) -> list[str]:
+    """
+    Extraction hybride des compétences.
+    Phase 1 : SKILL_MAP (normalisée, dédupliquée)
+    Phase 2 : Extraction libre (tokens techniques orphelins)
+    """
+    normalized = extract_skills_from_map(text)     # ex: {"Python", "Docker"}
+    free_form  = extract_free_skills(text)          # ex: {"Spring Boot", "Kafka", "Terraform"}
+
+    all_skills = normalized | free_form
+    return sorted(list(all_skills))
+
 
 def extract_degree(text: str) -> str | None:
     """
-    Détermine le niveau d'éducation le plus élevé. 
-    Retourne le nom capitalisé pour correspondre au DEGREE_RANK du matcher.
+    Détermine le niveau d'éducation le plus élevé.
     """
     text_lower = text.lower()
     best_degree = None
@@ -104,7 +174,6 @@ def extract_degree(text: str) -> str | None:
 def estimate_experience_years(text: str) -> float:
     """
     Calcule l'expérience pro en fusionnant les intervalles de dates.
-    Exclut les sections ou lignes liées à la formation.
     """
     current_year = datetime.datetime.now().year
     exp_headers = [r"expérience", r"experience", r"parcours professionnel", r"emplois", r"missions"]
@@ -135,7 +204,6 @@ def estimate_experience_years(text: str) -> float:
         unique_years = sorted(list(set([int(y) for y in years])))
         return float(min(current_year - unique_years[0], unique_years[-1] - unique_years[0]))
 
-    # Fusion d'intervalles (Merge Intervals) para éviter les doublons (CDI + Freelance)
     ranges = []
     for start, end in patterns:
         s_yr = int(start)
@@ -153,10 +221,6 @@ def estimate_experience_years(text: str) -> float:
     return round(float(sum(e - s for s, e in merged)), 1)
 
 def extract_name(text: str, email: str | None = None) -> str:
-    """
-    Tente de trouver le nom du candidat.
-    Heuristique : regarde les 5 premières lignes et ignore les lignes de contact.
-    """
     lines = [l.strip() for l in text.split("\n") if l.strip()]
     if not lines: return "Unknown Candidate"
     for line in lines[:5]:
@@ -164,6 +228,63 @@ def extract_name(text: str, email: str | None = None) -> str:
             return line
     if email: return email.split("@")[0].replace(".", " ").title()
     return "Unknown Candidate"
+
+def extract_sections(text: str) -> Dict[str, str]:
+    """
+    Découpe le texte du CV en sections via des expressions régulières robustes.
+    """
+    sections = {
+        "summary": "",
+        "experience": "",
+        "education": "",
+        "projects": "",
+        "skills": "",
+        "certifications": "",
+        "other": ""
+    }
+    
+    headers = {
+        "experience": [r"expérience", r"experience", r"parcours professionnel", r"emplois", r"missions", r"historique"],
+        "education": [r"formation", r"éducation", r"education", r"études", r"cursus", r"diplômes", r"académique"],
+        "projects": [r"projets", r"projects", r"réalisations", r"achievements"],
+        "skills": [r"compétences", r"skills", r"aptitudes", r"outils", r"technologies"],
+        "certifications": [r"certifications", r"certificats", r"acquisitions"],
+        "summary": [r"résumé", r"profil", r"summary", r"objectif", r"introduction"]
+    }
+    
+    lines = text.split("\n")
+    current_section = "summary"
+    
+    for line in lines:
+        l_low = line.lower().strip()
+        if not l_low: continue
+        
+        # Détection de header : 
+        # On cherche si la ligne commence par un mot-clé de header.
+        # On autorise jusqu'à 12 mots pour supporter "Section : Titre du poste"
+        found_header = False
+        for sec, patterns in headers.items():
+            for p in patterns:
+                # On cherche le mot-clé au début de la ligne, suivi d'un séparateur ou d'un mot.
+                # Regex : début de ligne, optionnel chiffre/puce, puis le mot-clé, 
+                # puis soit fin, soit colon, soit espace (début du titre de section).
+                header_regex = r"^\s*(?:\d?\.?\s*|[•·▪▸\-\s]*)" + p + r"s?\s*(?::|$|\s)"
+                if re.search(header_regex, l_low) and len(l_low.split()) <= 12:
+                    current_section = sec
+                    found_header = True
+                    break
+            if found_header: break
+        
+        # Cas spécial pour les langues qui sont souvent une section à part entière 
+        # mais qu'on peut ranger dans 'skills' ou 'other'
+        if not found_header and re.search(r"^\s*langues?\s*(:|$|\s)", l_low) and len(l_low.split()) <= 4:
+            current_section = "skills" # On range les langues dans skills pour le matching
+            found_header = True
+        
+        if not found_header:
+            sections[current_section] += line + "\n"
+            
+    return sections
 
 def parse_cv_pdf(file_bytes: bytes, filename: str = "cv.pdf") -> CandidateCV:
     """
@@ -185,3 +306,29 @@ def parse_cv_pdf(file_bytes: bytes, filename: str = "cv.pdf") -> CandidateCV:
         raw_text=raw_text
     )
     return candidate
+
+def parse_cv_to_structured_profile(file_bytes: bytes, filename: str = "cv.pdf") -> ParsedCandidateProfile:
+    """
+    Version améliorée de l'extraction : produit un profil structuré avec preuves par section.
+    """
+    cv_info = parse_cv_pdf(file_bytes, filename)
+    sections = extract_sections(cv_info.raw_text)
+    
+    evidence = []
+    for section_name, content in sections.items():
+        if len(content.strip()) > 20:
+            norm_entities = extract_skills(content)
+            evidence.append(CandidateEvidenceItem(
+                evidence_id=f"ev_{uuid.uuid4().hex[:6]}",
+                source_section=section_name,
+                original_text=content.strip(),
+                normalized_entities=norm_entities,
+                confidence_score=0.9 if section_name in ["experience", "projects"] else 0.7
+            ))
+            
+    return ParsedCandidateProfile(
+        candidate_id=cv_info.candidate_id,
+        cv_info=cv_info,
+        evidence=evidence,
+        sections=sections
+    )

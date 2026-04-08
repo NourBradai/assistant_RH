@@ -1,36 +1,64 @@
 """
 Routes pour la gestion des candidats et de leurs CVs.
-Supporte l'ajout manuel et l'upload de fichiers PDF avec extraction automatique.
+Supporte l'extraction structurée (Sectioning + Evidence).
 """
-from fastapi import APIRouter, UploadFile, File
-from app.models.schemas import CandidateCV
-from app.services.cv_parser import parse_cv_pdf
-from app.database import mock_candidates
+from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
+from sqlalchemy.orm import Session
+from app.models.schemas import CandidateCV, ParsedCandidateProfile
+from app.services.cv_parser import parse_cv_pdf, parse_cv_to_structured_profile
+from app.database import get_db
+from app.models.orm import CandidateModel
 
 router = APIRouter()
 
 @router.post("/")
-def add_candidate(cv: CandidateCV):
+def add_candidate(profile: ParsedCandidateProfile, db: Session = Depends(get_db)):
     """
-    Ajoute manuellement un profil de candidat déjà structuré.
+    Ajoute un profil candidat déjà structuré.
     """
-    mock_candidates.append(cv)
-    return {"message": "Candidate CV added successfully", "candidate": cv}
+    db_candidate = CandidateModel(
+        candidate_id=profile.candidate_id,
+        name=profile.cv_info.name,
+        data=profile.model_dump()
+    )
+    db.add(db_candidate)
+    db.commit()
+    return {"message": "Candidate profile added successfully", "candidate_id": profile.candidate_id}
 
 @router.post("/upload")
-async def upload_cv(file: UploadFile = File(...)):
+async def upload_cv(file: UploadFile = File(...), db: Session = Depends(get_db)):
     """
     Endpoint pour uploader un CV PDF.
-    Le fichier est analysé par cv_parser.py pour extraire les données.
+    Utilise parse_cv_to_structured_profile pour extraire les preuves par section.
     """
-    file_bytes = await file.read()
-    candidate = parse_cv_pdf(file_bytes, filename=file.filename)
-    mock_candidates.append(candidate)
-    return {"message": "CV uploaded and parsed successfully", "candidate": candidate}
+    try:
+        file_bytes = await file.read()
+        profile = parse_cv_to_structured_profile(file_bytes, filename=file.filename)
+        db_candidate = CandidateModel(
+            candidate_id=profile.candidate_id,
+            name=profile.cv_info.name,
+            data=profile.model_dump()
+        )
+        db.add(db_candidate)
+        db.commit()
+        return {"message": "CV uploaded and profiled successfully", "profile": profile}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing CV: {str(e)}")
 
 @router.get("/")
-def list_candidates():
+def list_candidates(db: Session = Depends(get_db)):
     """
-    Liste tous les candidats enregistrés.
+    Liste tous les profils candidats.
     """
-    return mock_candidates
+    candidates = db.query(CandidateModel).all()
+    return [ParsedCandidateProfile(**c.data) for c in candidates]
+
+@router.get("/{candidate_id}")
+def get_candidate(candidate_id: str, db: Session = Depends(get_db)):
+    """
+    Récupère un candidat spécifique.
+    """
+    candidate = db.query(CandidateModel).filter(CandidateModel.candidate_id == candidate_id).first()
+    if not candidate:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+    return ParsedCandidateProfile(**candidate.data)

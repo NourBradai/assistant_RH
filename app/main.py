@@ -15,6 +15,11 @@ from app.routes.jobs import router as jobs_router
 from app.routes.cvs import router as cvs_router
 from app.routes.screening import router as screening_router
 from app.routes.chatbot import router as chatbot_router
+from app.database import engine, Base
+from app.models import orm
+
+# Création des tables dans la base de données SQLite
+Base.metadata.create_all(bind=engine)
 
 # Configuration de l'application FastAPI
 app = FastAPI(

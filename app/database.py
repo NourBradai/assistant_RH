@@ -1,16 +1,19 @@
-"""
-Base de données simulée pour le Système de Filtrage des Candidats.
-Centralise les offres d'emploi, les profils candidats, les résultats de screening et les sessions chatbot.
-"""
+from sqlalchemy import create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
 
-# Liste globale des offres d'emploi
-mock_jobs = []
+SQLALCHEMY_DATABASE_URL = "sqlite:///./candidates.db"
 
-# Liste globale des candidats extraits
-mock_candidates = []
+engine = create_engine(
+    SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False}
+)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-# Liste globale des résultats de screening
-mock_screening_results = []
+Base = declarative_base()
 
-# Dictionnaire global des sessions chatbot {session_id: ChatbotSession}
-mock_chatbot_sessions = {}
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
