@@ -6,6 +6,11 @@ import re
 import uuid
 import datetime
 import fitz
+import nltk
+try:
+    from nltk.corpus import stopwords
+except ImportError:
+    pass
 from typing import Dict, List, Optional
 
 from app.models.schemas import CandidateCV, CandidateEvidenceItem, ParsedCandidateProfile
@@ -95,19 +100,40 @@ def extract_free_skills(text: str) -> set:
     """
     found = set()
 
-    # Mots parasites à exclure (trop génériques, lieux, étiquettes UI)
-    EXCLUDE = {
-        "de", "la", "le", "les", "et", "en", "avec", "sur", "pour", "du", "dans", "par",
-        "the", "and", "or", "with", "using", "of", "in", "at", "by", "to", "for",
-        "une", "un", "des", "au", "aux", "ai", "as", "est",
+    # Préparation des stopwords linguistiques (NLTK)
+    try:
+        fr_stops = set(stopwords.words('french'))
+        en_stops = set(stopwords.words('english'))
+    except LookupError:
+        nltk.download('stopwords', quiet=True)
+        fr_stops = set(stopwords.words('french'))
+        en_stops = set(stopwords.words('english'))
+
+    # Mots parasites métier non couverts par NLTK (contextuel HR/Tech)
+    DOMAIN_EXCLUDE = {
         "junior", "senior", "lead", "stage", "projet", "mission", "expérience",
         "compétences", "skills", "outils", "technologies", "connaissance", "maîtrise",
         "utilisation", "développement", "conception", "réalisation", "mise", "en", "œuvre",
-        "linkedin", "email", "téléphone", "phone", "adresse", "address", "tunis", "tunisie",
-        "france", "paris", "lyon", "maroc", "algérie", "présent", "present", "now", "today",
-        "janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre", "novembre", "décembre",
-        "january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december"
+        "linkedin", "email", "téléphone", "phone", "adresse", "address"
     }
+
+    # Nettoyage IA avancé : spaCy NER (Named Entity Recognition)
+    spacy_excludes = set()
+    try:
+        import spacy
+        nlp = spacy.load("fr_core_news_sm")
+        doc = nlp(text)
+        # On exclut Lieux (LOC, GPE), Dates (DATE, TIME) et Noms Propres (PERSON)
+        # Attention: On ne filtre SURTOUT PAS "ORG" ou "PRODUCT" qui pourraient correspondre à des technos !
+        for ent in doc.ents:
+            if ent.label_ in ["LOC", "GPE", "DATE", "TIME", "PERSON"]:
+                # Ex: "janvier", "2023", "Paris", "France"
+                for word in ent.text.split():
+                    spacy_excludes.add(word.lower().strip("(),.;/"))
+    except (ImportError, Exception):
+        pass # Fallback silencieux si spaCy n'est pas encore installé
+
+    EXCLUDE = fr_stops | en_stops | DOMAIN_EXCLUDE | spacy_excludes
 
     # On cible les lignes candidates = listes séparées ou tokens courts
     for line in text.split("\n"):

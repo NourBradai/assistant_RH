@@ -8,3 +8,5 @@ sentence-transformers
 httpx
 pytest
 sqlalchemy
+nltk
+spacy
