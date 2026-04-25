@@ -80,6 +80,9 @@ class ChatQuestion(BaseModel):
     objective: str
     target_requirement_id: Optional[str] = None  # ID de l'exigence ciblée
     expected_signals: List[str] = Field(default_factory=list)
+    #default_factory : Cette option garantit qu'une nouvelle 
+    # liste est créée chaque fois qu'une 
+    # nouvelle instance de votre classe est initialisée
     weight: float = 1.0
     priority: str = "medium"
 
@@ -210,3 +213,10 @@ class EnhancedScreeningResult(BaseModel):
     requirement_matches: List[RequirementMatchResult] = []
     summary: str
     status: str  # 'shortlisted', 'potential', 'rejected'
+
+
+class BatchMatchRequest(BaseModel):
+    """
+    Requête pour le matching groupé.
+    """
+    candidate_ids: Optional[List[str]] = None

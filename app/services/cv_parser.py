@@ -161,6 +161,7 @@ def extract_free_skills(text: str) -> set:
             ):
                 # On évite les tokens qui sont des phrases entières
                 if len(token.split()) <= 3:
+     
                     found.add(token)
 
     # Supprimer les tokens qui sont déjà couverts par la SKILL_MAP
@@ -204,6 +205,7 @@ def estimate_experience_years(text: str) -> float:
     current_year = datetime.datetime.now().year
     exp_headers = [r"expérience", r"experience", r"parcours professionnel", r"emplois", r"missions"]
     edu_headers = [r"formation", r"éducation", r"education", r"études", r"cursus", r"diplômes"]
+    stop_headers = edu_headers + [r"projets?", r"projects?", r"compétences", r"skills", r"certifications?", r"activités", r"langues?"]
     
     lines = text.split('\n')
     experience_text = ""
@@ -211,40 +213,64 @@ def estimate_experience_years(text: str) -> float:
     for line in lines:
         l_low = line.lower().strip()
         if not l_low: continue
+        
+        # Start of experience section
         if any(re.search(r"\b" + h + r"\b", l_low) for h in exp_headers):
             in_exp = True
             continue
-        if any(re.search(r"\b" + h + r"\b", l_low) for h in edu_headers):
+            
+        # End of experience section (Formation OR any other major section)
+        if any(re.search(r"\b" + h + r"\b", l_low) for h in stop_headers):
             in_exp = False
             continue
+            
         if in_exp:
+            # Skip lines that look like education/degrees even inside experience
             if not any(re.search(r"\b" + d + r"\b", l_low) for d in DEGREE_HIERARCHY.keys()):
                 experience_text += line + "\n"
     
-    source_text = experience_text if experience_text.strip() else text
-    patterns = re.findall(r"(\d{4})\s*[\-–—]\s*(\d{4}|présent|present|aujourd'hui|today|now)", source_text.lower())
-    
-    if not patterns:
-        years = re.findall(r"\b(20\d{2}|19\d{2})\b", source_text)
-        if len(years) < 2: return 0.0
-        unique_years = sorted(list(set([int(y) for y in years])))
-        return float(min(current_year - unique_years[0], unique_years[-1] - unique_years[0]))
+    # If no experience section found, return 0 instead of falling back to whole CV
+    if not experience_text.strip():
+        return 0.0
 
+    # Search for date ranges in the extracted experience section ONLY
+    source_text = experience_text.lower()
+    patterns = re.findall(r"(\d{4})\s*[\-–—]\s*(\d{4}|présent|present|aujourd'hui|today|now)", source_text)
+    
     ranges = []
     for start, end in patterns:
-        s_yr = int(start)
-        e_yr = current_year if end in ["présent", "present", "aujourd'hui", "today", "now"] else int(end)
-        if e_yr >= s_yr: ranges.append([s_yr, e_yr])
+        try:
+            s_yr = int(start)
+            e_yr = current_year if end in ["présent", "present", "aujourd'hui", "today", "now"] else int(end)
+            if 1950 < s_yr <= current_year and 1950 < e_yr <= current_year + 5:
+                if e_yr >= s_yr: ranges.append([s_yr, e_yr])
+        except ValueError:
+            continue
     
-    if not ranges: return 0.0
-    ranges.sort()
-    merged = [ranges[0]]
-    for cur in ranges[1:]:
-        prev = merged[-1]
-        if cur[0] <= prev[1]: prev[1] = max(prev[1], cur[1])
-        else: merged.append(cur)
+    if not ranges:
+        # Fallback: find individual years in experience section
+        years = re.findall(r"\b(20\d{2}|19\d{2})\b", source_text)
+        if len(years) < 2: 
+            # Check if it contains "stage" or "internship"
+            if any(k in source_text for k in ["stage", "internship", "stagiaire"]):
+                return 0.0
+            return 0.0
+        unique_years = sorted(list(set([int(y) for y in years])))
+        total_years = float(min(current_year - unique_years[0], unique_years[-1] - unique_years[0]))
+    else:
+        ranges.sort()
+        merged = [ranges[0]]
+        for cur in ranges[1:]:
+            prev = merged[-1]
+            if cur[0] <= prev[1]: prev[1] = max(prev[1], cur[1])
+            else: merged.append(cur)
+        total_years = round(float(sum(e - s for s, e in merged)), 1)
     
-    return round(float(sum(e - s for s, e in merged)), 1)
+    # Heuristique finale : si le texte d'expérience contient le mot "stage" et que la durée est faible
+    if any(k in source_text for k in ["stage", "internship", "stagiaire"]) and total_years <= 1.0:
+        return 0.0
+        
+    return total_years
 
 def extract_name(text: str, email: str | None = None) -> str:
     lines = [l.strip() for l in text.split("\n") if l.strip()]
@@ -319,7 +345,7 @@ def parse_cv_pdf(file_bytes: bytes, filename: str = "cv.pdf") -> CandidateCV:
     raw_text = extract_text_from_pdf(file_bytes)
     email = extract_email(raw_text)
     candidate = CandidateCV(
-        candidate_id=str(uuid.uuid4()),
+        candidate_id=str(uuid.uuid5(uuid.NAMESPACE_DNS, filename)),
         name=extract_name(raw_text, email),
         email=email,
         phone=extract_phone(raw_text),
